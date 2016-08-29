@@ -72,6 +72,7 @@
                                (d/success! d x token))))
                          (catch Throwable e
                            (log/error e "error in seq stream")
+                           (d/error! (s/error-deferred this) e)
                            (.markDrained this)
                            (d/success! d default-val)))))))]
         (if (d/realized? d')

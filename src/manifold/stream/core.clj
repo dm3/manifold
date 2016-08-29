@@ -11,6 +11,7 @@
   (isSynchronous [])
   (downstream [])
   (weakHandle [reference-queue])
+  (errorDeferred [])
   (close []))
 
 (definterface IEventSink
@@ -28,11 +29,16 @@
   (onDrained [callback])
   (connector [sink]))
 
-(definline close!
+(defn close!
   "Closes an event sink, so that it can't accept any more messages."
-  [sink]
-  `(let [^manifold.stream.core.IEventStream x# ~sink]
-     (.close x#)))
+  ([^manifold.stream.core.IEventStream sink] (.close sink))
+  ([^manifold.stream.core.IEventStream sink error]
+   (manifold.deferred/error! (.errorDeferred sink) error)
+   (.close sink)))
+
+(definline error!
+  [x error]
+  `(manifold.deferred/error! (.errorDeferred ~x) ~error))
 
 (definline closed?
   "Returns true if the event sink is closed."
@@ -48,6 +54,12 @@
   "Returns a weak reference that can be used to construct topologies of streams."
   [x]
   `(.weakHandle ~(with-meta x {:tag "manifold.stream.core.IEventStream"}) nil))
+
+(definline error-deferred
+  "Returns a deferred which will resolve into an exception if an error happens
+  within the stream."
+  [x]
+  `(.errorDeferred ~(with-meta x {:tag "manifold.stream.core.IEventStream"})))
 
 (definline synchronous?
   "Returns true if the underlying abstraction behaves synchronously, using thread blocking
@@ -87,7 +99,10 @@
        (manifold.utils/with-lock ~'lock
          (or ~'__weakHandle
            (set! ~'__weakHandle (java.lang.ref.WeakReference. this# ref-queue#)))))
-     (~'close [this#])))
+     (~'close [this#])
+     (~'errorDeferred [this#]
+       (or ~'__errorDeferred
+         (set! ~'__errorDeferred (manifold.deferred/deferred))))))
 
 (def ^:private sink-params
   '[lock
@@ -95,7 +110,7 @@
     ^:volatile-mutable __isClosed
     ^java.util.LinkedList __closedCallbacks
     ^:volatile-mutable __weakHandle
-    ^:volatile-mutable __mta])
+    ^:volatile-mutable __errorDeferred])
 
 (def ^:private default-sink-impls
   `[(~'close [this#] (.markClosed this#))
@@ -115,7 +130,8 @@
     ^:volatile-mutable __mta
     ^:volatile-mutable __isDrained
     ^java.util.LinkedList __drainedCallbacks
-    ^:volatile-mutable __weakHandle])
+    ^:volatile-mutable __weakHandle
+    ^:volatile-mutable __errorDeferred])
 
 (def ^:private default-source-impls
   `[(~'isDrained [this#] ~'__isDrained)
@@ -149,7 +165,7 @@
 
      (defn ~(with-meta (symbol (str "->" name)) {:private true})
        [~@(map #(with-meta % nil) params)]
-       (new ~name ~@params (manifold.utils/mutex) nil false (java.util.LinkedList.) nil))))
+       (new ~name ~@params (manifold.utils/mutex) nil false (java.util.LinkedList.) nil nil))))
 
 (defmacro def-sink [name params & body]
   `(do
@@ -163,7 +179,7 @@
 
      (defn ~(with-meta (symbol (str "->" name)) {:private true})
        [~@(map #(with-meta % nil) params)]
-       (new ~name ~@params (manifold.utils/mutex) nil false (java.util.LinkedList.) nil))))
+       (new ~name ~@params (manifold.utils/mutex) nil false (java.util.LinkedList.) nil nil))))
 
 (defmacro def-sink+source [name params & body]
   `(do
@@ -178,4 +194,4 @@
 
      (defn ~(with-meta (symbol (str "->" name)) {:private true})
        [~@(map #(with-meta % nil) params)]
-       (new ~name ~@params (manifold.utils/mutex) nil false (java.util.LinkedList.) nil false (java.util.LinkedList.)))))
+       (new ~name ~@params (manifold.utils/mutex) nil false (java.util.LinkedList.) nil nil false (java.util.LinkedList.)))))

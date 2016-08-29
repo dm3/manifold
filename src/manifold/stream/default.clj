@@ -63,14 +63,16 @@
           (try
             (add!)
             (catch Throwable e
-              (log/error e "error in stream transformer")))
+              (log/error e "error in stream transformer")
+              (s/error! this e)))
 
           (loop []
             (when-let [^Consumer c (.poll consumers)]
               (try
                 (d/success! (.deferred c) (.default-val c))
                 (catch Throwable e
-                  (log/error e "error in callback")))
+                  (log/error e "error in callback")
+                  (s/error! this e)))
               (recur)))
 
           (.markClosed this)
@@ -93,8 +95,8 @@
                 (d/success-deferred false executor)
                 (add! this msg))
               (catch Throwable e
-                (.close this)
                 (log/error e "error in stream transformer")
+                (s/close! this e)
                 (d/success-deferred false))))
 
           close?
@@ -110,8 +112,9 @@
 
             (instance? Producer result)
             (do
-              (log/warn (IllegalStateException.) "excessive pending puts (> 16384), closing stream")
-              (s/close! this)
+              (let [e (IllegalStateException.)]
+                (log/warn e "excessive pending puts (> 16384), closing stream")
+                (s/close! this e))
               (d/success-deferred false executor))
 
             (instance? Production result)
@@ -191,8 +194,9 @@
 
         (instance? Consumer result)
         (do
-          (log/warn (IllegalStateException.) "excessive pending takes (> 16384), closing stream")
-          (s/close! this)
+          (let [e (IllegalStateException.)]
+            (log/warn e "excessive pending takes (> 16384), closing stream")
+            (s/close! this e))
           (d/success-deferred false executor))
 
         (instance? Consumption result)
@@ -200,7 +204,8 @@
           (try
             (d/success! (.deferred result) true (.token result))
             (catch Throwable e
-              (log/error e "error in callback")))
+              (log/error e "error in callback")
+              (s/error! this e)))
           (let [msg (.message result)]
             (if blocking?
               msg

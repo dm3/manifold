@@ -88,7 +88,7 @@
               (.put sink msg true (.timeout d) ::timeout))
             (catch Throwable e
               (log/error e "error in message propagation")
-              (s/close! sink)
+              (s/close! sink e)
               false))]
     (when (false? x)
       (.remove dsts d)
@@ -96,6 +96,10 @@
         (s/close! upstream)))
     (when (and (identical? ::timeout x) (.downstream? d))
       (s/close! sink))))
+
+(defn- propagate-single-sink-error [source sink]
+  (d/connect (s/error-deferred sink)
+             (s/error-deferred source)))
 
 (defn- handle-async-put [^AsyncPut x val source]
   (let [d (.deferred x)]
@@ -107,6 +111,7 @@
       (let [^CopyOnWriteArrayList l (.dsts x)]
         (.remove l (.dst x))
         (when (or (.upstream? x) (== 0 (.size l)))
+          (propagate-single-sink-error source (.sink (.dst x)))
           (s/close! source)
           (.remove handle->downstreams (s/weak-handle source))))
 
@@ -114,11 +119,12 @@
       (s/close! val))))
 
 (defn- handle-async-error [^AsyncPut x err source]
-  (some-> ^Downstream (.dst x) .sink s/close!)
+  (some-> ^Downstream (.dst x) .sink (s/close! err))
   (log/error err "error in message propagation")
   (let [^CopyOnWriteArrayList l (.dsts x)]
     (.remove l (.dst x))
     (when (or (.upstream? x) (== 0 (.size l)))
+      (propagate-single-sink-error source (.sink (.dst x)))
       (s/close! source)
       (.remove handle->downstreams (s/weak-handle source)))))
 

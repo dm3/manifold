@@ -103,6 +103,8 @@
     (.close ^IEventStream sink))
   (weakHandle [_ ref-queue]
     (.weakHandle ^IEventStream sink ref-queue))
+  (errorDeferred [_]
+    (.errorDeferred ^IEventStream sink))
   IEventSink
   (put [_ x blocking?]
     (.put sink x blocking?))
@@ -127,6 +129,8 @@
     (.close ^IEventStream source))
   (weakHandle [_ ref-queue]
     (.weakHandle ^IEventStream source ref-queue))
+  (errorDeferred [_]
+    (.errorDeferred ^IEventStream source))
   IEventSource
   (take [_ default-val blocking?]
     (.take source default-val blocking?))
@@ -189,6 +193,12 @@
   "Returns a weak reference that can be used to construct topologies of streams."
   [x]
   `(.weakHandle ~(with-meta x {:tag "manifold.stream.core.IEventStream"}) nil))
+
+(definline error-deferred
+  "Returns a deferred which will resolve into an exception if an error happens
+  within the stream."
+  [x]
+  `(.errorDeferred ~(with-meta x {:tag "manifold.stream.core.IEventStream"})))
 
 (definline synchronous?
   "Returns true if the underlying abstraction behaves synchronously, using thread blocking
@@ -297,8 +307,30 @@
 
 (require '[manifold.stream.graph])
 
+(defn propagate-error
+  ([src dst] (propagate-error src dst {}))
+  ([src dst {:keys [upstream? downstream?] :or {upstream? false, downstream? true}}]
+   (let [error (error-deferred dst)]
+     (when downstream?
+       (d/connect (error-deferred src) error))
+     (when upstream?
+       (d/connect error (error-deferred src)))
+     ;; TODO: there's no good way of closing the `src` if `dst` gets
+     ;; error-closed while being the only sink of `src`.
+     ;; If we try to do that in side `catch error`, we don't yet see `src` as drained.
+     ;; If we try to do that `on-drained src`, we can't know why the drain got
+     ;; triggered (may have happened a long time after the `dst` error).
+     ;; So we do that inside manifold.stream.graph/handle-async-*
+     (d/catch error
+       #(do (doseq [[_ d] (downstream dst)]
+              (d/error! (error-deferred d) %)))))))
+
 (defn connect
   "Connects a source to a sink, propagating all messages from the former into the latter.
+
+   Closing the sink will close the source if
+     * `upstream?` is set to true
+     * the sink is the only sink connected to this source
 
    Optionally takes a map of parameters:
 
@@ -325,6 +357,7 @@
     (let [source (->source source)
           sink (->sink sink)
           connector (.connector ^IEventSource source sink)]
+      (propagate-error source sink options)
       (if connector
         (connector source sink options)
         (manifold.stream.graph/connect source sink options))
@@ -398,6 +431,9 @@
     (.close ^IEventStream sink))
   (weakHandle [_ ref-queue]
     (.weakHandle ^IEventStream source ref-queue))
+  (errorDeferred [_]
+    (d/zip (.errorDeferred ^IEventStream source)
+           (.errorDeferred ^IEventStream sink)))
 
   IEventSink
   (put [_ x blocking?]
@@ -433,7 +469,8 @@
     [f
      close-callback
      ^IEventSink downstream
-     constant-response]
+     constant-response
+     error-deferred]
   IEventStream
   (isSynchronous [_]
     false)
@@ -447,7 +484,10 @@
   (description [_]
     {:type "callback"})
   (downstream [_]
-    (when downstream [downstream]))
+    (when downstream
+      [[(description downstream) downstream]]))
+  (errorDeferred [_]
+    error-deferred)
   IEventSink
   (put [this x _]
     (try
@@ -457,7 +497,7 @@
           constant-response))
       (catch Throwable e
         (log/error e "error in stream handler")
-        (.close this)
+        (core/close! this e)
         (d/success-deferred false))))
   (put [this x default-val _ _]
     (.put this x default-val))
@@ -474,10 +514,11 @@
     "Feeds all messages from `source` into `callback`.
 
      Messages will be processed as quickly as the callback can be executed. Returns
-     a deferred which yields `true` when `source` is exhausted."
+     a deferred which yields `true` when `source` is exhausted or throws if the
+     callback throws."
     [callback source]
     (let [complete (d/deferred)]
-      (connect source (Callback. callback #(d/success! complete true) nil result) nil)
+      (connect source (Callback. callback #(d/success! complete true) nil result complete) nil)
       complete)))
 
 (defn consume-async
@@ -485,10 +526,11 @@
    `true` or `false`.  If the returned value yields `false`, the consumption will be cancelled.
 
    Messages will be processed only as quickly as the deferred values are realized. Returns a
-   deferred which yields `true` when `source` is exhausted or `callback` yields `false`."
+   deferred which yields `true` when `source` is exhausted or `callback` yields
+   `false`. Otherwise throws if the callback throws."
   [callback source]
   (let [complete (d/deferred)]
-    (connect source (Callback. callback #(d/success! complete true) nil nil) nil)
+    (connect source (Callback. callback #(d/success! complete true) nil nil complete) nil)
     complete))
 
 (defn connect-via
@@ -508,7 +550,7 @@
                             (d/success! complete true))]
       (connect
         src
-        (Callback. callback close-callback dst nil)
+        (Callback. callback close-callback dst nil complete)
         options)
       complete)))
 
@@ -524,7 +566,7 @@
                            (d/success! complete true))]
      (connect
        src
-       (Callback. #(put! proxy %) close-callback dst nil)
+       (Callback. #(put! proxy %) close-callback dst nil complete)
        options)
      complete)))
 
@@ -537,7 +579,7 @@
         complete (d/deferred)]
     (connect
       src
-      (Callback. #(put! dst %) #(d/success! complete true) dst nil)
+      (Callback. #(put! dst %) #(d/success! complete true) dst nil complete)
       {:description "drain-into"})
     complete))
 
@@ -581,8 +623,8 @@
                         (periodically- stream period (- period (rem (System/currentTimeMillis) period)) f)))))))
             (catch Throwable e
               (@cancel)
-              (close! stream)
-              (log/error e "error in 'periodically' callback"))))))))
+              (log/error e "error in 'periodically' callback")
+              (core/close! stream e))))))))
 
 (defn periodically
   "Creates a stream which emits the result of invoking `(f)` every `period` milliseconds."
@@ -629,7 +671,7 @@
           (d/chain' #(put! s' %))
           (d/catch' (fn [e]
                       (log/error e "deferred realized as error, closing stream")
-                      (close! s')
+                      (core/close! s' e)
                       false))))
       s'
       {:description {:op "realize-each"}})
@@ -647,7 +689,8 @@
             dst (stream)]
 
         (doseq [[a b] (clj/map list srcs intermediates)]
-          (connect-via a #(put! b %) b {:description {:op "zip"}}))
+          (connect-via a #(put! b %) b {:description {:op "zip"}})
+          (propagate-error b dst))
 
         (d/loop []
           (d/chain'
@@ -702,6 +745,7 @@
                       (put! s' x)))
                   (d/catch' (fn [e]
                               (log/error e "error in reductions")
+                              (d/error! (error-deferred s') e)
                               (close! s)
                              false)))))
             s')))
@@ -768,9 +812,9 @@
             (let [curr (try
                          (f msg)
                          (catch Throwable e
-                           (close! in)
-                           (close! out)
                            (log/error e "error in lazily-partition-by")
+                           (close! in)
+                           (core/close! out e)
                            ::error))]
               (when-not (identical? ::error curr)
                 (if (= prev curr)
@@ -861,6 +905,8 @@
       (do
         (compare-and-set! handle nil (WeakReference. this ref-queue))
         @handle)))
+  (errorDeferred [this]
+    (.errorDeferred ^IEventStream buf))
 
   IEventSink
   (put [_ x blocking?]
@@ -1000,6 +1046,7 @@
           s' (stream)]
 
       (connect-via-proxy s buf s' {:description {:op "batch"}})
+      ;; TODO: below isn't needed because connect-via-proxy already takes care of that
       (on-closed s' #(close! buf))
 
       (d/loop [msgs [], size 0, earliest-message -1, last-message -1]
@@ -1066,6 +1113,7 @@
            period (double (/ 1000 max-rate))]
 
        (connect-via-proxy s buf s' {:description {:op "throttle"}})
+       ;; TODO: below isn't needed because connect-via-proxy already takes care of that
        (on-closed s' #(close! buf))
 
        (d/loop [backlog 0.0, read-start (System/currentTimeMillis)]

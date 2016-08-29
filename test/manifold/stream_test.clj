@@ -149,6 +149,26 @@
     (is (= nil    @(s/take! s)))
     (is (= true   (s/drained? s)))))
 
+(def throwing-fn
+  (fn [& args] (throw (Exception. "boom"))))
+
+(defn errored? [s]
+  (let [e (try @(-> (s/error-deferred s)
+                    (d/timeout! 100 ::timeout))
+               (catch Exception e e))]
+    (and (instance? Exception e)
+         (= (.getMessage e) "boom"))))
+
+(defmacro is-errored [s]
+  `(do
+     (~'is (~'thrown-with-msg? java.lang.Exception #"boom"
+             @(-> (s/error-deferred ~s)
+                  (d/timeout! 100 ::timeout))))
+     (if (s/sink? ~s)
+       (~'is (s/closed? ~s))
+       (do (s/take! ~s ::none)
+           (~'is (s/drained? ~s))))))
+
 (deftest test-transducers
   (let [s (s/stream 0
             (comp
@@ -168,7 +188,12 @@
 
     (comp (map inc) (filter even?)) (range 10)
 
-    (comp (map inc) (take 5)) (range 10)))
+    (comp (map inc) (take 5)) (range 10))
+
+  (testing "captures error"
+    (let [s (s/stream 0 (map throwing-fn))]
+      (s/put! s 1)
+      (is-errored s))))
 
 (deftest test-reduce
   (let [inputs (range 1e2)]
@@ -177,7 +202,11 @@
         @(s/reduce + (s/->source inputs))))
     (is
       (= (reduce + 1 inputs)
-        @(s/reduce + 1 (s/->source inputs))))))
+        @(s/reduce + 1 (s/->source inputs)))))
+
+  (testing "captures error"
+    (is (thrown-with-msg? Exception #"boom"
+          @(s/reduce throwing-fn (s/->source [1 2]))))))
 
 (deftest test-zip
   (let [inputs (partition-all 1e4 (range 3e4))]
@@ -186,7 +215,15 @@
         (->> inputs
           (map s/->source)
           (apply s/zip)
-          s/stream->seq)))))
+          s/stream->seq))))
+
+  (testing "captures error"
+    (let [in1 (s/stream), in2 (s/stream)
+          out (s/zip (s/map throwing-fn in1) in2)]
+      (s/put! in1 ::anything)
+      ;; TODO: is it a bug? Zipped stream doesn't short-circuit its drained? status on error
+      (s/put! in2 ::anything)
+      (is-errored out))))
 
 (deftest test-lazily-partition-by
   (let [inputs (range 1e2)
@@ -197,7 +234,13 @@
           s/->source
           (s/lazily-partition-by f)
           s/stream->seq
-          (map (comp doall s/stream->seq)))))))
+          (map (comp doall s/stream->seq))))))
+
+  (testing "captures error"
+    (let [in (s/stream)
+          out (s/lazily-partition-by throwing-fn in)]
+      (s/put! in ::anything)
+      (is-errored out))))
 
 (defn test-batch [metric max-size]
   (let [inputs (repeat 10 metric)
@@ -224,6 +267,16 @@
               s/->source
               (s/batch identity 2 1e4)
               s/stream->seq)))))
+
+(deftest test-batch-errors
+  (testing "captures error in metric fn"
+    (let [in (s/stream)
+          b (s/batch 2 in)
+          f (s/map throwing-fn b)]
+      (s/put! in 1)
+      (s/put! in 2)
+      (is-errored f)
+      (is-errored b))))
 
 (deftest test-concat
   (let [inputs (range 1e2)
